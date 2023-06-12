@@ -59,6 +59,7 @@ class AcceleratedOptimizer(torch.optim.Optimizer):
         self.gradient_state = GradientState()
         self.device_placement = device_placement
         self._is_overflow = False
+        self._skipped_step = False
 
         # Handle device placement
         if device_placement:
@@ -125,19 +126,22 @@ class AcceleratedOptimizer(torch.optim.Optimizer):
                     self.optimizer.zero_grad()
 
     def step(self, closure=None):
-        if self.gradient_state.sync_gradients:
-            if self.accelerator_state.distributed_type == DistributedType.TPU:
-                optimizer_args = {"closure": closure} if closure is not None else {}
-                xm.optimizer_step(self.optimizer, optimizer_args=optimizer_args)
-            elif self.scaler is not None:
-                scale_before = self.scaler.get_scale()
-                self.scaler.step(self.optimizer, closure)
-                self.scaler.update()
-                scale_after = self.scaler.get_scale()
-                # If we reduced the loss scale, it means the optimizer step was skipped because of gradient overflow.
-                self._is_overflow = scale_after < scale_before
-            else:
-                self.optimizer.step(closure)
+        if not self.gradient_state.sync_gradients:
+            self._skipped_step = True
+        self._skipped_step = False
+
+        if self.accelerator_state.distributed_type == DistributedType.TPU:
+            optimizer_args = {"closure": closure} if closure is not None else {}
+            xm.optimizer_step(self.optimizer, optimizer_args=optimizer_args)
+        elif self.scaler is not None:
+            scale_before = self.scaler.get_scale()
+            self.scaler.step(self.optimizer, closure)
+            self.scaler.update()
+            scale_after = self.scaler.get_scale()
+            # If we reduced the loss scale, it means the optimizer step was skipped because of gradient overflow.
+            self._is_overflow = scale_after < scale_before
+        else:
+            self.optimizer.step(closure)
 
     def _switch_parameters(self, parameters_map):
         for param_group in self.optimizer.param_groups:
@@ -156,7 +160,7 @@ class AcceleratedOptimizer(torch.optim.Optimizer):
     @property
     def step_was_skipped(self):
         """Whether or not the optimizer step was skipped."""
-        return self._is_overflow
+        return self._is_overflow or self._skipped_step
 
     def __getstate__(self):
         return self.__dict__.copy()
